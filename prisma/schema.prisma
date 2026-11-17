@@ -1,0 +1,565 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// ───────────── Справочники (редактируются в админке) ─────────────
+
+/// Роль человека: Креатив, Разработчик, Траффер, Айти. «Фронт» — дочерняя метка Разработчика.
+model Role {
+  id        String     @id @default(cuid())
+  name      String     @unique
+  parentId  String?
+  sortOrder Int        @default(0)
+  active    Boolean    @default(true)
+  parent    Role?      @relation("RoleTree", fields: [parentId], references: [id])
+  children  Role[]     @relation("RoleTree")
+  users     UserRole[]
+  directions Direction[]
+}
+
+/// Направление задачи. roleId — роль, которая нужна исполнителю (null — можно любому).
+model Direction {
+  id        String    @id @default(cuid())
+  name      String    @unique
+  color     String    @default("#64748b")
+  roleId    String?
+  /// подпись поля подтипа в карточке: «Метка», «Рекламная сеть»
+  subtypeLabel String @default("Підтип")
+  sortOrder Int       @default(0)
+  active    Boolean   @default(true)
+  role      Role?     @relation(fields: [roleId], references: [id], onDelete: SetNull)
+  subtypes  Subtype[]
+  tasks     Task[]
+  grants    DirectionGrant[]
+  recurring RecurringTask[]
+}
+
+/// Подтип направления: «Фронт» у Разработки, рекламные сети у Рекламы.
+model Subtype {
+  id          String    @id @default(cuid())
+  directionId String
+  name        String
+  sortOrder   Int       @default(0)
+  active      Boolean   @default(true)
+  direction   Direction @relation(fields: [directionId], references: [id], onDelete: Cascade)
+  tasks       Task[]
+  grants      DirectionGrant[]
+  recurring   RecurringTask[]
+
+  @@unique([directionId, name])
+}
+
+/// Основные направления бизнеса — кнопки в форме задачи (вписать своё тоже можно).
+model BusinessLine {
+  id        String  @id @default(cuid())
+  name      String  @unique
+  color     String  @default("#1d2130")
+  sortOrder Int     @default(0)
+  active    Boolean @default(true)
+}
+
+// ───────────── Люди и доступ ─────────────
+
+model User {
+  id             String   @id @default(cuid())
+  login          String   @unique
+  passwordHash   String
+  name           String
+  /// 1 исполнитель · 2 руководитель группы · 3 руководитель направления · 4 админ
+  level          Int      @default(1)
+  contacts       String   @default("")
+  telegram       String   @default("")
+  telegramChatId String?  @unique
+  /// одноразовый код для привязки бота: t.me/<bot>?start=<код>
+  tgLinkCode     String?  @unique
+  /// утренняя сводка в Telegram (9:00 по Киеву)
+  notifyDigest   Boolean  @default(true)
+  /// постоянная зона ответственности, отдельно от текущих задач
+  responsibility String   @default("")
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+
+  roles          UserRole[]
+  grants         DirectionGrant[]
+  subordinates   Subordination[] @relation("manager")
+  managers       Subordination[] @relation("subordinate")
+  sessions       Session[]
+  assignedTasks  Task[]          @relation("assignee")
+  createdTasks   Task[]          @relation("creator")
+  watching       Watcher[]
+  mentions       TaskMention[]
+  comments       Comment[]
+  events         TaskEvent[]
+  attachments    Attachment[]
+  workDays       WorkDay[]
+  requests       Request[]       @relation("requester")
+  decided        Request[]       @relation("decider")
+  audit          AuditLog[]
+  recurring      RecurringTask[] @relation("recurringAssignee")
+  notifications  Notification[]
+  reminders      Reminder[]      @relation("reminderFor")
+  remindersSet   Reminder[]      @relation("reminderBy")
+  drafts         Draft[]
+  boards         ProjectMember[]
+  savedViews     SavedView[]
+  resources      Resource[]
+}
+
+model UserRole {
+  userId String
+  roleId String
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+}
+
+/// Доступ уровня 3: всё направление (subtypeId = null) или только один подтип.
+model DirectionGrant {
+  id          String    @id @default(cuid())
+  userId      String
+  directionId String
+  subtypeId   String?
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  direction   Direction @relation(fields: [directionId], references: [id], onDelete: Cascade)
+  subtype     Subtype?  @relation(fields: [subtypeId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, directionId, subtypeId])
+}
+
+/// Руководитель группы (уровень 2) → подчинённый.
+model Subordination {
+  managerId     String
+  subordinateId String
+  manager       User @relation("manager", fields: [managerId], references: [id], onDelete: Cascade)
+  subordinate   User @relation("subordinate", fields: [subordinateId], references: [id], onDelete: Cascade)
+
+  @@id([managerId, subordinateId])
+}
+
+model Session {
+  id         String   @id
+  userId     String
+  expiresAt  DateTime
+  /// «Запомнить это устройство»: долгая cookie с продлением; иначе — до закрытия браузера
+  persistent Boolean  @default(true)
+  /// браузер и система — для списка устройств в профиле
+  userAgent  String   @default("")
+  lastSeenAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ───────────── Доски ─────────────
+
+/// Проект = доска.
+model Project {
+  id          String        @id @default(cuid())
+  name        String        @unique
+  description String        @default("")
+  color       String        @default("#2563eb")
+  sortOrder   Int           @default(0)
+  archivedAt  DateTime?
+  /// черновик доски: видят только админы, уведомления не уходят до публикации
+  isDraft     Boolean       @default(false)
+  /// доступ к доске: true — все сотрудники; false — только выбранные (members) и админы
+  accessAll   Boolean       @default(false)
+  /// кто создал доску: вместе с админами может её редактировать (null — создана до этого поля)
+  creatorId   String?
+  members     ProjectMember[]
+  createdAt   DateTime      @default(now())
+  columns     BoardColumn[]
+  tasks       Task[]
+  recurring   RecurringTask[]
+}
+
+model BoardColumn {
+  id        String  @id @default(cuid())
+  projectId String
+  name      String
+  color     String  @default("#64748b")
+  sortOrder Int     @default(0)
+  /// попадание в эту колонку = задача выполнена (completedAt)
+  isDone    Boolean @default(false)
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  tasks     Task[]
+
+  @@index([projectId])
+}
+
+// ───────────── Задачи ─────────────
+
+model Task {
+  id           String    @id @default(cuid())
+  title        String
+  description  String    @default("")
+  projectId    String
+  columnId     String
+  /// порядок внутри колонки
+  position     Float     @default(0)
+  directionId  String
+  subtypeId    String?
+  /// вид работы из справочника или своё значение, вписанное вручную
+  /// «Засчитано в срок»: работу сделали вовремя, статус просто поменяли позже — в отчётах не опоздание
+  lateOk       Boolean   @default(false)
+  business     String?
+  assigneeId   String
+  creatorId    String
+  /// HIGH | MEDIUM | LOW
+  priority     String    @default("MEDIUM")
+  deadline     DateTime?
+  parentId     String?
+  completedAt  DateTime?
+  archivedAt   DateTime?
+  recurringId  String?
+  /// день текучки YYYY-MM-DD (Киев)
+  recurringDay String?
+  /// задел: метрика результата (лиды, заявки, объём)
+  resultMetric String?
+  resultValue  Float?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  project   Project        @relation(fields: [projectId], references: [id])
+  column    BoardColumn    @relation(fields: [columnId], references: [id])
+  direction Direction      @relation(fields: [directionId], references: [id])
+  subtype   Subtype?       @relation(fields: [subtypeId], references: [id], onDelete: SetNull)
+  assignee  User           @relation("assignee", fields: [assigneeId], references: [id])
+  creator   User           @relation("creator", fields: [creatorId], references: [id])
+  parent    Task?          @relation("Subtasks", fields: [parentId], references: [id], onDelete: SetNull)
+  children  Task[]         @relation("Subtasks")
+  recurring RecurringTask? @relation(fields: [recurringId], references: [id], onDelete: SetNull)
+
+  watchers    Watcher[]
+  mentions    TaskMention[]
+  links       TaskLink[]
+  attachments Attachment[]
+  checklist   ChecklistItem[]
+  comments    Comment[]
+  events      TaskEvent[]
+  resources   TaskResource[]
+  reminders   Reminder[]
+  blocking    TaskDependency[] @relation("blocker")
+  blockedBy   TaskDependency[] @relation("blocked")
+
+  @@unique([recurringId, recurringDay])
+  @@index([projectId, columnId, position])
+  @@index([assigneeId])
+  @@index([directionId])
+  @@index([business])
+  @@index([parentId])
+  @@index([deadline])
+  @@index([completedAt])
+}
+
+model Watcher {
+  taskId String
+  userId String
+  task   Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([taskId, userId])
+  @@index([userId])
+}
+
+/// Человек упомянут через @ в комментарии — видит задачу.
+model TaskMention {
+  taskId String
+  userId String
+  task   Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([taskId, userId])
+  @@index([userId])
+}
+
+model TaskLink {
+  id        String @id @default(cuid())
+  taskId    String
+  label     String
+  url       String
+  sortOrder Int    @default(0)
+  task      Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+}
+
+model Attachment {
+  id         String   @id @default(cuid())
+  taskId     String
+  uploaderId String
+  fileName   String
+  storedName String   @unique
+  size       Int
+  mime       String
+  createdAt  DateTime @default(now())
+  task       Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  uploader   User     @relation(fields: [uploaderId], references: [id])
+
+  @@index([taskId])
+}
+
+model ChecklistItem {
+  id        String  @id @default(cuid())
+  taskId    String
+  text      String
+  done      Boolean @default(false)
+  sortOrder Int     @default(0)
+  task      Task    @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+}
+
+model Comment {
+  id        String   @id @default(cuid())
+  taskId    String
+  authorId  String
+  text      String
+  createdAt DateTime @default(now())
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  author    User     @relation(fields: [authorId], references: [id])
+
+  @@index([taskId])
+}
+
+/// История изменений карточки: кто, что и когда поменял.
+model TaskEvent {
+  id        String   @id @default(cuid())
+  taskId    String
+  actorId   String
+  /// created | column | field | archive | restore | comment | checklist | link | attachment | subtask
+  type      String
+  field     String?
+  fromValue String?
+  toValue   String?
+  createdAt DateTime @default(now())
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  actor     User     @relation(fields: [actorId], references: [id])
+
+  @@index([taskId])
+}
+
+// ───────────── Запросы, журнал, текучка, уведомления ─────────────
+
+/// Задача, которую автор не может поставить напрямую: ждёт решения админа.
+model Request {
+  id          String    @id @default(cuid())
+  /// ASSIGN — назначение от Креатива · REQUEST — запрос на задачу
+  type        String
+  /// PENDING | APPROVED | REJECTED
+  status      String    @default("PENDING")
+  requesterId String
+  /// JSON-черновик задачи
+  payload     String
+  note        String    @default("")
+  taskId      String?
+  decidedById String?
+  decidedAt   DateTime?
+  decisionNote String   @default("")
+  createdAt   DateTime  @default(now())
+  requester   User      @relation("requester", fields: [requesterId], references: [id])
+  decidedBy   User?     @relation("decider", fields: [decidedById], references: [id])
+
+  @@index([status])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String?
+  action    String
+  entity    String
+  entityId  String?
+  detail    String   @default("")
+  createdAt DateTime @default(now())
+  actor     User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+}
+
+/// Текучка: шаблон ежедневной задачи.
+model RecurringTask {
+  id           String    @id @default(cuid())
+  title        String
+  description  String    @default("")
+  assigneeId   String
+  projectId    String
+  directionId  String
+  subtypeId    String?
+  priority     String    @default("MEDIUM")
+  /// срок в течение дня, HH:MM по Киеву
+  dueTime      String    @default("09:00")
+  /// дни недели 1..7 (пн..вс)
+  weekdays     String    @default("1234567")
+  /// за сколько минут до срока напомнить в Telegram
+  remindBefore Int       @default(60)
+  active       Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  assignee     User      @relation("recurringAssignee", fields: [assigneeId], references: [id])
+  project      Project   @relation(fields: [projectId], references: [id])
+  direction    Direction @relation(fields: [directionId], references: [id])
+  subtype      Subtype?  @relation(fields: [subtypeId], references: [id], onDelete: SetNull)
+  tasks        Task[]
+}
+
+/// Очередь уведомлений для Telegram-бота.
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  /// assigned | deadline | comment | mention | status | recurring | request
+  type      String
+  taskId    String?
+  text      String
+  sentAt    DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([sentAt])
+}
+
+/// Сохранённый вид доски («вся реклама», «весь фронт»). userId = null — общий.
+model SavedView {
+  id        String  @id @default(cuid())
+  userId    String?
+  name      String
+  /// строка запроса фильтров
+  query     String
+  sortOrder Int     @default(0)
+  user      User?   @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ───────────── Задел на следующие этапы, без интерфейса ─────────────
+
+/// Ресурс: сайт, канал, FB-страница, группа, аккаунт, сервер.
+model Resource {
+  id          String    @id @default(cuid())
+  /// site | channel | fb_page | group | account | server
+  kind        String
+  name        String
+  url         String    @default("")
+  status      String    @default("active")
+  ownerId     String?
+  /// закрытые данные (логины/пароли) — видит только админ
+  secret      String?
+  /// реестр групп: дата последнего поста
+  lastPostAt  DateTime?
+  createdAt   DateTime  @default(now())
+  owner       User?     @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+  tasks       TaskResource[]
+}
+
+model TaskResource {
+  taskId     String
+  resourceId String
+  task       Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  resource   Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+
+  @@id([taskId, resourceId])
+}
+
+/// blocker блокирует blocked («ждёт»).
+model TaskDependency {
+  blockerId String
+  blockedId String
+  blocker   Task @relation("blocker", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked   Task @relation("blocked", fields: [blockedId], references: [id], onDelete: Cascade)
+
+  @@id([blockerId, blockedId])
+}
+
+model TaskTemplate {
+  id        String   @id @default(cuid())
+  name      String
+  /// JSON: поля задачи и чек-лист
+  payload   String
+  createdAt DateTime @default(now())
+}
+
+/// Попытки входа: защита от подбора пароля и журнал входов.
+model LoginAttempt {
+  id        String   @id @default(cuid())
+  /// введённый логин (может не существовать)
+  login     String
+  ip        String
+  ok        Boolean
+  userAgent String   @default("")
+  createdAt DateTime @default(now())
+
+  @@index([login, createdAt])
+  @@index([ip, createdAt])
+}
+
+/// Личное напоминание по задаче: себе или (руководитель) исполнителю. Бот присылает в remindAt.
+model Reminder {
+  id        String    @id @default(cuid())
+  taskId    String
+  /// кому напомнить
+  userId    String
+  /// кто поставил
+  creatorId String
+  remindAt  DateTime
+  note      String    @default("")
+  sentAt    DateTime?
+  createdAt DateTime  @default(now())
+  task      Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user      User      @relation("reminderFor", fields: [userId], references: [id], onDelete: Cascade)
+  creator   User      @relation("reminderBy", fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@index([sentAt, remindAt])
+  @@index([taskId])
+}
+
+/// Черновик задачи: незаконченная форма, видна только автору. При создании задачи удаляется.
+model Draft {
+  id        String   @id @default(cuid())
+  userId    String
+  title     String   @default("")
+  /// JSON с полями формы задачи
+  payload   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+/// Кто имеет доступ к доске с ограниченным доступом (Project.accessAll = false).
+model ProjectMember {
+  projectId String
+  userId    String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, userId])
+  @@index([userId])
+}
+
+/// Место работы для отметки дня: Удалёнка, Офис 1, Офис 2, Коворкінг (правится в админке).
+model WorkPlace {
+  id        String  @id @default(cuid())
+  name      String  @unique
+  sortOrder Int     @default(0)
+  active    Boolean @default(true)
+}
+
+/// Отметка рабочего дня: «Начало дня» (место + время) и «Конец дня». Один день — одна отметка.
+model WorkDay {
+  id        String    @id @default(cuid())
+  userId    String
+  /// день по Киеву, YYYY-MM-DD
+  day       String
+  /// название места на момент отметки (переименование места старые дни не меняет)
+  place     String
+  startedAt DateTime
+  endedAt   DateTime?
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, day])
+  @@index([day])
+}

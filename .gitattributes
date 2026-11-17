@@ -1,0 +1,7 @@
+# единые окончания строк
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary
+*.ttf binary
+*.pdf binary
